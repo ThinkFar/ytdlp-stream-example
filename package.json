@@ -4,6 +4,9 @@
   "description": "Direct browser streaming player using ytdlp-nodejs and Express",
   "type": "module",
   "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
