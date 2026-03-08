@@ -7,17 +7,23 @@ import path from 'path';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 
-// ── Binary init ───────────────────────────────────────────────────────────
-// @vercel/node bundles JS via ncc, so __dirname inside the function resolves
-// to /var/task/ (project root), NOT node_modules/ytdlp-nodejs/.
-// findYtdlpBinary() therefore looks in /var/task/bin/ — finds nothing —
-// passes binaryPath:'' → spawn fails with exit code 127 (command not found).
+// ── Binary resolution ────────────────────────────────────────────────────────
 //
-// Fix: on cold start, download the Linux x64 binary to /tmp (writable on
-// Vercel), cache the YtDlp instance in memory for warm requests.
+// Strategy (fastest first):
+//   1. ./bin/yt-dlp  ← bundled at build time via vercel-build + includeFiles
+//      No download needed; zero cold-start penalty.
+//   2. /tmp/ytdlp-bin/yt-dlp  ← fallback if bundle was skipped (local dev
+//      or first deploy before build ran). Downloads once per container.
+//
+// WHY explicit binaryPath:
+//   @vercel/node bundles JS so __dirname inside ytdlp-nodejs resolves to
+//   /var/task/ (project root), not node_modules/ytdlp-nodejs/.
+//   findYtdlpBinary() therefore looks in /var/task/bin/ and finds nothing
+//   unless we either bundle it there OR pass binaryPath explicitly.
 
+const BUNDLED_BIN  = path.join(__dirname, 'bin', 'yt-dlp');  // bundled path
 const TMP_BIN_DIR  = '/tmp/ytdlp-bin';
-const TMP_BIN_PATH = path.join(TMP_BIN_DIR, 'yt-dlp');  // Linux x64 filename
+const TMP_BIN_PATH = path.join(TMP_BIN_DIR, 'yt-dlp');       // fallback
 
 let ytdlpInstance = null;
 let initPromise   = null;
@@ -25,33 +31,37 @@ let initPromise   = null;
 async function initYtDlp() {
   if (ytdlpInstance) return ytdlpInstance;
 
-  if (process.env.VERCEL) {
+  let binaryPath;
+
+  if (existsSync(BUNDLED_BIN)) {
+    // ★ Fast path: binary was bundled at build time
+    console.log('[init] using bundled binary at', BUNDLED_BIN);
+    binaryPath = BUNDLED_BIN;
+  } else {
+    // Fallback: download to /tmp (writable on Vercel)
     if (!existsSync(TMP_BIN_PATH)) {
-      console.log('[init] cold start — downloading yt-dlp to /tmp/ytdlp-bin ...');
+      console.log('[init] bundled binary not found — downloading to /tmp ...');
       mkdirSync(TMP_BIN_DIR, { recursive: true });
       await helpers.downloadYtDlp(TMP_BIN_DIR);
-      console.log('[init] yt-dlp ready →', TMP_BIN_PATH);
+      console.log('[init] downloaded to', TMP_BIN_PATH);
     } else {
-      console.log('[init] yt-dlp found in /tmp, reusing');
+      console.log('[init] reusing /tmp binary');
     }
-    ytdlpInstance = new YtDlp({ binaryPath: TMP_BIN_PATH });
-  } else {
-    ytdlpInstance = new YtDlp();  // local: uses default PATH / node_modules bin
+    binaryPath = TMP_BIN_PATH;
   }
 
+  ytdlpInstance = new YtDlp({ binaryPath });
   return ytdlpInstance;
 }
 
-// Kick off init immediately on module load (non-blocking) so
-// the binary is ready by the time the first real request arrives.
 function getYtDlp() {
   if (!initPromise) initPromise = initYtDlp();
   return initPromise;
 }
 
-if (process.env.VERCEL) {
-  getYtDlp().catch((err) => console.error('[init error]', err.message));
-}
+// Start init immediately at module load so the binary is ready
+// by the time the first real request arrives.
+getYtDlp().catch((err) => console.error('[init error]', err.message));
 
 // ── Static files ────────────────────────────────────────────────────────
 app.use(express.static(path.join(__dirname, 'public')));
@@ -94,7 +104,6 @@ app.get('/api/formats', async (req, res) => {
 });
 
 // ── GET /stream?url=&quality=&type= ──────────────────────────────────────
-// Pipes ytdlp PassThrough directly to HTTP response – no disk I/O.
 app.get('/stream', async (req, res) => {
   const { url, quality = 'highest', type = 'mp4' } = req.query;
   if (!url) return res.status(400).json({ error: 'url param required' });
@@ -133,7 +142,7 @@ app.get('/stream', async (req, res) => {
   }
 });
 
-// ── Local dev server (Vercel sets process.env.VERCEL) ────────────────────
+// ── Local dev server ───────────────────────────────────────────────────
 if (!process.env.VERCEL) {
   const PORT = process.env.PORT ?? 3000;
   app.listen(PORT, () => console.log(`\n🎬  ytdlp Stream Player  →  http://localhost:${PORT}\n`));
